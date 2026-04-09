@@ -1,0 +1,267 @@
+-- allium: 3
+-- Replay: HTTP request mirroring for Kubernetes Gateway API traffic mirroring.
+--
+-- Receives mirrored HTTP requests, samples a configurable percentage,
+-- discards non-GET requests, and forwards the survivors to target backends.
+-- Fire-and-forget: responses are never inspected.
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum HttpMethod { get | post | put | patch | delete | head | options }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value TargetAddress {
+    -- A resolved pod IP and port. Opaque to this spec.
+    address: String
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity MirrorRequest {
+    method: HttpMethod
+    path: String
+    headers: List<String>
+    targets: List<TargetAddress>
+
+    -- Derived
+    is_get: method = get
+}
+
+entity MirrorService {
+    status: idle | running | stopped
+
+    -- Relationships
+    in_flight_requests: ActiveMirror with service = this
+
+    transitions status {
+        idle -> running
+        running -> stopped
+        terminal: stopped
+    }
+}
+
+entity ActiveMirror {
+    -- Represents a mirror request currently being sent to a target.
+    -- Exists for the duration of the outbound HTTP call.
+    request: MirrorRequest
+    target: TargetAddress
+    service: MirrorService
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    sample_rate: Decimal = 0.10
+    channel_buffer_size: Integer = 1024
+    max_concurrent_requests: Integer = 50
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Flow: Request arrival and filtering
+
+rule DiscardNonGet {
+    when: RequestArrived(request)
+    requires: not request.is_get
+
+    ensures:
+        RequestDiscarded(request: request, reason: not_get)
+        requests_dropped.increment
+
+    @guidance
+        -- Non-GET requests are dropped silently. No error, no log entry.
+}
+
+rule SampleRequest {
+    when: RequestArrived(request)
+    requires: request.is_get
+    requires: not sampled(request, config.sample_rate)
+
+    ensures:
+        RequestDiscarded(request: request, reason: not_sampled)
+        requests_dropped.increment
+
+    @guidance
+        -- Each request is independently sampled. The sampling function
+        -- returns true with probability equal to sample_rate.
+}
+
+rule AcceptRequest {
+    when: RequestArrived(request)
+    requires: request.is_get
+    requires: sampled(request, config.sample_rate)
+
+    ensures: RequestAccepted(request: request)
+}
+
+-- Flow: Mirror execution
+
+rule MirrorToTargets {
+    when: RequestAccepted(request)
+    requires: request.targets.count > 0
+
+    let service = MirrorService where status = running
+    requires: exists service
+    requires: service.in_flight_requests.count + request.targets.count <= config.max_concurrent_requests
+
+    ensures:
+        for target in request.targets:
+            ActiveMirror.created(
+                request: request,
+                target: target,
+                service: service
+            )
+
+    @guidance
+        -- For each target in the request, opens a TCP connection and sends
+        -- a cleartext HTTP/1.1 request in parallel. The request is forwarded
+        -- unaltered: method, path (including query string), and all headers
+        -- are preserved exactly as received.
+        -- No request body is sent (GET only).
+        -- Each target consumes one slot from the concurrency limit.
+}
+
+rule MirrorSucceeded {
+    when: mirror: ActiveMirror.completed
+
+    ensures:
+        not exists mirror
+        requests_mirrored.increment
+
+    @guidance
+        -- The response from the target is discarded entirely.
+        -- No status code inspection, no body reading, no latency
+        -- measurement. The ActiveMirror entity is removed once the
+        -- outbound call completes successfully.
+}
+
+rule MirrorFailed {
+    when: mirror: ActiveMirror.failed
+
+    ensures:
+        not exists mirror
+        requests_failed.increment
+
+    @guidance
+        -- Connection refused, timeout, or any other error.
+        -- The failure is counted but not logged or retried.
+        -- The ActiveMirror entity is removed.
+}
+
+rule DropWhenAtCapacity {
+    when: RequestAccepted(request)
+
+    let service = MirrorService where status = running
+    requires: exists service
+    requires: service.in_flight_requests.count + request.targets.count > config.max_concurrent_requests
+
+    ensures:
+        RequestDiscarded(request: request, reason: at_capacity)
+        requests_dropped.increment
+
+    @guidance
+        -- When the concurrency limit is reached, new requests are
+        -- dropped rather than queued. No backpressure signal is sent.
+}
+
+rule DropWhenTargetUnavailable {
+    when: RequestAccepted(request)
+    requires: request.targets.count = 0
+
+    ensures:
+        RequestDiscarded(request: request, reason: no_target)
+        requests_dropped.increment
+}
+
+-- Flow: Service lifecycle
+
+rule StartService {
+    when: StartService(service)
+    requires: service.status = idle
+
+    ensures: service.status = running
+}
+
+rule StopService {
+    when: StopService(service)
+    requires: service.status = running
+
+    ensures: service.status = stopped
+
+    @guidance
+        -- On shutdown, in-flight mirror requests may be abandoned.
+        -- No graceful drain is required.
+}
+
+------------------------------------------------------------
+-- Counters
+------------------------------------------------------------
+
+counter requests_mirrored {
+    -- Incremented once per successful outbound mirror request.
+    -- A request fanned out to 3 targets increments this by 3.
+}
+
+counter requests_failed {
+    -- Incremented when an outbound mirror request fails
+    -- (connection refused, timeout, etc). Per-target, not per-request.
+}
+
+counter requests_dropped {
+    -- Incremented when a request is discarded before mirroring.
+    -- Covers: non-GET, not sampled, at capacity, no target,
+    -- and channel-full (try_send failure in the gateway).
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant ConcurrencyBound {
+    for service in MirrorServices:
+        service.in_flight_requests.count <= config.max_concurrent_requests
+}
+
+invariant SampleRateInRange {
+    config.sample_rate >= 0.0 and config.sample_rate <= 1.0
+}
+
+@invariant NoResponseInspection
+    -- The system never reads, logs, or acts on any data from
+    -- mirror target HTTP responses. Responses are discarded at
+    -- the transport level.
+
+@invariant NoRetries
+    -- Failed mirror requests are never retried. If a target is
+    -- unreachable or slow, the request is silently dropped.
+
+@invariant RequestUnaltered
+    -- Mirrored requests are forwarded exactly as received. No
+    -- headers are added, removed, or modified. The path and
+    -- query string are preserved verbatim.
+
+------------------------------------------------------------
+-- Resolved Decisions
+------------------------------------------------------------
+
+-- Multi-target fanout: send to ALL targets in parallel.
+-- Each target consumes one concurrency slot.
+
+-- Channel-full observability: the gateway should increment
+-- requests_dropped when try_send fails. This crate exposes
+-- the counter; the gateway is responsible for incrementing it
+-- on channel-full.
+
+-- Shutdown: abandon in-flight requests immediately.
+-- No graceful drain.
