@@ -1,0 +1,16 @@
+[package]
+name = "replay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+rand = "0.9"
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "test-util", "net", "io-util"] }
